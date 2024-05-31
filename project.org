@@ -1,0 +1,373 @@
+:PROPERTIES:
+:header-args:python: :var in_file=training_file
+:header-args:python+: target_file=target_file
+:header-args:python+: features=features
+:header-args:python+: verification_size=96
+:END:
+#+title: Decision Trees
+#+author: Bruno Bonatto
+
+* Meta
+#+name: features
+- Corolla_diameter
+- Total_corolla_Length
+- Corolla_tube_length
+- Pistil_Anther_Difference
+- UV_absorbance
+- Odor_Day
+- Odor_Night
+- R
+- G
+- B
+
+#+name: training_file
+: missing.csv
+
+#+name: target_file
+: missing_target.csv
+
+#+begin_src python :session :results output
+import pandas as pd
+import numpy as np
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.tree import export_text
+from random import sample, shuffle
+from collections import defaultdict
+import csv
+
+dtypes = defaultdict(np.float64)
+dtypes["Individual"] = str
+dtypes["Rep"] = np.int64
+dtypes["Pollinator"] = str
+
+
+def cleanup(cell):
+    if isinstance(cell, str):
+        cell = (
+            cell.replace(".", "")
+            .replace(",", ".")
+            .replace(" ", "")
+            .replace(">", "")
+            .replace(":", "")
+        )
+        if cell.upper() == "YES" or cell == True:
+            return "1"
+        if cell.upper() == "NO" or cell == False:
+            return "-1"
+    return cell
+
+
+def clean_file(filename):
+    buffer = ""
+    with open(filename, mode="r") as file:
+        reader = csv.reader(file)
+        for row in reader:
+            buffer += ",".join([cleanup(c) for c in row]) + "\n"
+    with open(filename, mode="w") as file:
+        file.write(buffer)
+
+
+clean_file(in_file)
+clean_file(target_file)
+
+
+class Dropper:
+    def __init__(self, features):
+        self.features = features
+
+    def fit(self, X, *_):
+        return self
+
+    def transform(self, X, *_):
+        return X[self.features].values
+
+
+imp = SimpleImputer(missing_values=np.nan, strategy="mean")
+scaler = MinMaxScaler(feature_range=(0, 1))
+pipe = Pipeline(
+    [
+        ("drop", Dropper(features)),
+        ("imputer", imp),
+        ("scaler", scaler),
+    ]
+)
+
+
+def read_training(
+    in_file=in_file,
+    features=features,
+    verification_size=verification_size,
+    pipe=pipe,
+):
+    training = pd.read_csv(in_file, dtype=dtypes)
+    idx = list(training.index)
+    shuffle(idx)
+    training = training.reindex(idx)
+    verification_set = training.iloc[
+        sample(range(int(training.shape[0])), verification_size)
+    ]
+    training = training.drop(verification_set.index)
+    raw = training
+    raw = pipe.fit_transform(raw)
+    raw = raw.T
+    for (i, f) in enumerate(features):
+        training[f] = raw[i]
+    raw = verification_set
+    raw = pipe.transform(raw)
+    raw = raw.T
+    for (i, f) in enumerate(features):
+        verification_set[f] = raw[i]
+    return (training, verification_set, pipe)
+
+
+def read_target(
+    target_file=target_file,
+    features=features,
+    pipe=pipe,
+):
+    target = pd.read_csv(target_file)
+    raw = target
+    raw = pipe.transform(raw)
+    raw = raw.T
+    for (i, f) in enumerate(features):
+        target[f] = raw[i]
+    return target
+
+
+def weight_samples(training):
+    cls_count = 1 / training.groupby(by="Pollinator")["Individual"].count() / 3
+    weights = training["Pollinator"].map(cls_count.to_dict())
+    return weights
+
+
+def verify(estimator, verification_set, features=features):
+    verification_predictions = estimator.predict(verification_set[features])
+    verification = verification_set[["Individual", "Pollinator"]].assign(
+        Prediction=verification_predictions
+    )
+    bad = verification.query("Pollinator != Prediction")
+    return bad
+
+
+def do(
+    estimator,
+    in_file=in_file,
+    target_file=target_file,
+    features=features,
+    verification_size=verification_size,
+    pipe=pipe,
+    takes_weights=True,
+):
+    training, verification_set, pipe = read_training(
+        in_file, features, verification_size, pipe
+    )
+    if takes_weights:
+        weights = weight_samples(training)
+        estimator = estimator.fit(
+            training[features], training["Pollinator"], sample_weight=weights
+        )
+    else:
+        estimator = estimator.fit(training[features], training["Pollinator"])
+    print("verification")
+    bad = verify(estimator, verification_set, features=features)
+    hit_perc = 1 - (bad.shape[0] / (bad.shape[0] + training.shape[0]))
+    print(f"hit percentage: {round(hit_perc*100, 2)}%")
+    if hit_perc < 1:
+        print(bad)
+    target = read_target(target_file=target_file, features=features, pipe=pipe)
+    predictions = estimator.predict(target[features])
+    results = pd.DataFrame(
+        data={
+            "Individual": target["Individual"],
+            "Rep": target["Rep"],
+            "Pollinator": predictions,
+        }
+    )
+    print("---")
+    print("predictions")
+    print(results.groupby(["Pollinator"]).count())
+    return (estimator, predictions, hit_perc)
+#+end_src
+
+* K-neighbors
+#+begin_src python :session :results output
+from sklearn.neighbors import KNeighborsClassifier
+
+meta_params = {
+    "n_neighbors": 5,
+    "weights": "uniform",
+    "algorithm": "auto",
+    "leaf_size": 30,
+    "p": 2,
+    "metric": "minkowski",
+    "metric_params": None,
+    "n_jobs": None,
+}
+
+estimator = KNeighborsClassifier(**meta_params)
+do(estimator, takes_weights=False)
+#+end_src
+
+* Decision trees
+#+begin_src python :session :results output
+from sklearn.tree import DecisionTreeClassifier
+
+meta_params = {
+    "criterion": "gini",
+    "splitter": "best",
+    "max_depth": None,
+    "min_samples_split": 2,
+    "min_samples_leaf": 1,
+    "min_weight_fraction_leaf": 0.05,
+    "max_features": None,
+    "random_state": None,
+    "max_leaf_nodes": None,
+    "min_impurity_decrease": 0,
+    "class_weight": None,
+    "ccp_alpha": 0.02,
+}
+
+estimator = DecisionTreeClassifier(**meta_params)
+cls, _, _ = do(estimator)
+print("---")
+print(
+    export_text(
+        cls, feature_names=features, class_names=["Moth", "Bee", "Humming-bird"]
+    )
+)
+#+end_src
+
+* Random forest
+#+begin_src python :session :results output
+from sklearn.ensemble import RandomForestClassifier
+
+meta_params = {
+    "n_estimators": 100,
+    "criterion": "gini",
+    "max_depth": None,
+    "min_samples_split": 2,
+    "min_samples_leaf": 1,
+    "min_weight_fraction_leaf": 0.05,
+    "max_features": "sqrt",
+    "max_leaf_nodes": None,
+    "min_impurity_decrease": 0,
+    "bootstrap": True,
+    "oob_score": False,
+    "n_jobs": None,
+    "random_state": None,
+    "verbose": 0,
+    "warm_start": False,
+    "class_weight": None,
+    "ccp_alpha": 0.02,
+    "max_samples": None,
+}
+
+estimator = RandomForestClassifier(**meta_params)
+do(estimator)
+#+end_src
+
+* Text
+** Data pre-processing
+Feature engineering is a critical step of developing any machine-learning
+application [https://doi.org/10.1111/2041-210X.13992], therefore we examine
+our available data.
+
+Our dataset is composed 321 samples and 30 attributes ('Corolla_diameter',
+'Total_corolla_Length', 'Corolla_tube_length', 'Pistil_Anther_Difference',
+'Nectar_vol', 'Nectar', 'Polen', 'UV_absorbance', 'Odor', 'RGB', '280_nm',
+'290_nm', '300_nm', '310_nm', '320_nm', '330_nm', '340_nm', '350_nm',
+'360_nm', '370_nm', '380_nm', '470_nm', '480_nm', '490_nm', '500_nm',
+'510_nm', '520_nm', '530_nm', '540_nm', '550_nm', '560_nm').
+
+The RGB attribute was split into it's 3 components.
+Odor, whose possible values were {'No', 'Yes-Day', 'Yes-Night', 'Yes'}, was
+transformed into two boolean attributes 'Odor_day' and 'Odor_night'.
+This leaves us with a set of 34 possible features.
+
+The raw dataset is very sparse, with a large amount of data missing,
+only 38.7% of possible values being present. One feature (Polen) was
+present in only 9.3% of samples.
+However in 6 features ('Corolla_diameter', 'Total_corolla_Length',
+'Pistil_Anther_Difference', 'UV_absorbance', 'Odor_Day', 'Odor_Night') all
+data is present and in another 4 ('Corolla_tube_length', 'R', 'G', 'B') there
+is less than 1% of data missing.
+
+We decided to discard all other features
+and keep only this reduced set of ten. The rest of the missing values were
+then filled using a simple mean imputing strategy.
+
+
+** Algorithm selection
+3 algorithms were used: decision trees, k-neighbors, random forest.
+Decision trees were selected first because they're easy to understand and
+offer very high interpretability.
+Random forest was used for comparison with decision tree.
+K-neighbors was selected by recommendation from the literature
+[https://biodatamining.biomedcentral.com/articles/10.1186/s13040-017-0155-3].
+
+
+** Model evaluation
+Before any training could be done we separated a random sample of 96
+individuals as a verification set and used the model's accuracy on this
+set as it's performance. We then shuffled the remaining data so as to
+avoid any information the input order might have leaking to the model.
+
+Then we replace all missing values by arithmetic average of that column,
+then scale all values into the range [0, 1].
+
+Finally we trained each model using their scikit-learn implementation [https://jmlr.csail.mit.edu/papers/v12/pedregosa11a.html].
+Specifically during the decision tree's training we included a per-sample
+weight parameter, in order to balance the importance of the three classes.
+The meta-parameters used during training can be found below:
+
+K-neighbors:
+| Parameter     | Used      | Default   |
+|---------------+-----------+-----------|
+| n_neighbors   | 5         | 5         |
+| weights       | uniform   | uniform   |
+| algorithm     | auto      | auto      |
+| leaf_size     | 30        | 30        |
+| p             | 2         | 2         |
+| metric        | minkowski | minkowski |
+| metric_params | None      | None      |
+| n_jobs        | None      | None      |
+
+Decision tree:
+| Parameter                | Used | Default |
+|--------------------------+------+---------|
+| criterion                | gini | gini    |
+| splitter                 | best | best    |
+| max_depth                | None | None    |
+| min_samples_split        | 2    | 2       |
+| min_samples_leaf         | 1    | 1       |
+| min_weight_fraction_leaf | 0.05 | 0.0     |
+| max_features             | None | None    |
+| random_state             | None | None    |
+| max_leaf_nodes           | None | None    |
+| min_impurity_decrease    | 0.0  | 0.0     |
+| class_weight             | None | None    |
+| ccp_alpha                | 0.02 | 0.0     |
+
+Random forest:
+| Parameter                | Used  | Default |
+|--------------------------+-------+---------|
+| n_estimators             | 100   | 100     |
+| criterion                | gini  | gini    |
+| max_depth                | None  | None    |
+| min_samples_split        | 2     | 2       |
+| min_samples_leaf         | 1     | 1       |
+| min_weight_fraction_leaf | 0.05  | 0.0     |
+| max_features             | sqrt  | sqrt    |
+| max_leaf_nodes           | None  | None    |
+| min_impurity_decrease    | 0     | 0.0     |
+| bootstrap                | True  | True    |
+| oob_score                | False | False   |
+| n_jobs                   | None  | None    |
+| random_state             | None  | None    |
+| verbose                  | 0     | 0       |
+| warm_start               | False | Flase   |
+| class_weight             | None  | None    |
+| ccp_alpha                | 0.02  | 0.0     |
+| max_samples              | None  | None    |
